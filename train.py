@@ -191,7 +191,6 @@ def set_loader(config):
     Validate hugginface token
     '''
     
-
     try:
         api = HfApi(token=token)
         user_info = api.whoami()
@@ -485,16 +484,14 @@ class UniversalTrainer:
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
                 else:
-                    outputs = self.model(features)
+                    outputs = self.model(features).permute(0, 2, 1)
+                    labels = labels.long()
                     print(outputs.shape)
                     print(labels.shape)
                     input("Getting output shape")
-                    features = torch.mean(features, dim=1) # or reshaped_x.mean(dim=1)
-                    f1, f2 = torch.split(features, [bsz, bsz], dim=0)
-                    features = torch.cat([f1.unsqueeze(1), f2.unsqueeze(1)], dim=1)
-                    loss = self.criterion(features, labels)
 
-                    #losses.update(loss.item(), bsz)
+                    loss = self.criterion(outputs, labels)
+
                     # Backward pass
                     loss.backward()
 
@@ -512,12 +509,12 @@ class UniversalTrainer:
 
                 # Log detailed batch info every 100 batches
                 if batch_idx % 100 == 0:
-                    current_lr = self.optimizer.current_lr
+                    #current_lr = self.optimizer.current_lr
                     #for param_group in self.optimizer.param_groups:
                     #    current_lr = param_group['lr']
                     # Build loss component string based on what's available
                     loss_parts = [f"Loss={loss.item():.4f}"]
-                    loss_parts.append(f"LR={current_lr:.2e}")
+                    #loss_parts.append(f"LR={current_lr:.2e}")
                     self.logger.info(
                         f"   📊 Batch {batch_idx}: {', '.join(loss_parts)}"
                     )
@@ -950,33 +947,6 @@ def create_config():
     # Set up paths - only support split files for better performance
     base_dir = Path(__file__).parent
 
- 
-    if args.train_files and args.val_files:
-        # Use explicitly provided split file lists
-        args.train_files_path = base_dir / args.train_files
-        args.val_files_path = base_dir / args.val_files
-    else:
-        # Auto-detect split files in standard locations
-        dataset_dir = base_dir / args.dataset_dir
-        args.train_files_path = dataset_dir / "train_splits" / "train_files.txt"
-        args.val_files_path = dataset_dir / "val_splits" / "val_files.txt"
-
-    # Validate split file lists exist
-    if not args.train_files_path.exists():
-        raise FileNotFoundError(
-            f"Training file list not found: {args.train_files_path}\n"
-            f"Please run split_hdf5.py to create split files, or use --train-files to specify path."
-        )
-    if not args.val_files_path.exists():
-        raise FileNotFoundError(
-            f"Validation file list not found: {args.val_files_path}\n"
-            f"Please run split_hdf5.py to create split files, or use --val-files to specify path."
-        )
-
-    print("📁 Using split dataset files:")
-    print(f"   - Train files: {args.train_files_path}")
-    print(f"   - Val files: {args.val_files_path}")
-
     return args
 
 
@@ -1083,19 +1053,6 @@ def main():
             f.write(str(os.getpid()))
         print(f"📝 PID file created: {pid_file}")
 
-    print("🎯 Manufacturing Action Completion Detection Training")
-    print("=" * 55)
-    print(f"📁 Dataset: {config.dataset_dir}")
-    print(f"🎮 Device: {config.device}")
-    print(f"📊 Batch size: {getattr(config, 'batch_size', 'from config')}")
-    print(f"🔄 Epochs: {getattr(config, 'epochs', 'from config')}")
-    print(
-        f"📈 Learning rates: {getattr(config, 'backbone_lr', 'from config')} / {getattr(config, 'head_lr', 'from config')}"
-    )
-    print(f"💾 Output: {config.output_dir}")
-    if config.background:
-        print(f"🔄 Background mode: PID {os.getpid()}")
-    print("=" * 55)
 
     # Create trainer and start training
     trainer = UniversalTrainer(config)

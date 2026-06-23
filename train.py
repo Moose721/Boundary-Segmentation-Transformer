@@ -503,6 +503,12 @@ class UniversalTrainer:
 
                     self.optimizer.step()
                 print(f"{batch_idx}: {loss.item()}")
+                pred_actions = outputs.argmax(dim=1)
+                true_actions = labels
+                action_accuracy += (
+                    (pred_actions == true_actions).float().mean().item()
+                )
+                print(f"{batch_idx}: {action_accuracy}")
                 # Accumulate losses (uniform API)
                 total_loss += loss.item()
                 #print("Total loss:")

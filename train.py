@@ -40,8 +40,7 @@ from timm.loss import JsdCrossEntropy
 #import models
 import torch.nn as nn
 
-
-DATA_SYNC_ID = '100478946840763112718'
+from local_datasets import *
 
 def set_seed(seed=42):
     """Set random seed for reproducibility"""
@@ -53,131 +52,11 @@ def set_seed(seed=42):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-train_transform = v2.Compose([
-        v2.ToDtype(torch.float32, scale=True),
-        v2.RandomHorizontalFlip(),
-        #v2.RandomApply([
-        #    v2.ColorJitter(0.4, 0.4, 0.4, 0.1)
-        #], p=0.8),
-        #v2.RandomGrayscale(p=0.2),
-        #v2.Normalize(mean=[0.54, 0.5, 0.474], std=[0.234, 0.235, 0.231])
-    ])
-
 #used to initialize head weights
 def initialize_weights(m):
     if isinstance(m, (nn.Linear)):
         trunc_normal_(m.weight, std=.02)
         nn.init.constant_(m.bias, 0)
-
-def process_youtube_videos(batch, transform=None):
-    #print("Spawned thread")
-    ydl_opts = {
-        'cookiefile': 'premium_cookies.txt',
-        'format': 'bestvideo[ext=mp4]/mp4',  
-        'js_runtimes': { 'node': {'path': None} }, 
-        'extractor_args': {
-            'youtube': {
-                'player_skip': ['webpage', 'configs'],
-                #'player_client': ['web_safari', 'web_creator']
-            }
-        },
-        'quiet': True,
-        'no_warnings': True,
-        'skip_download': True
-    }
-
-    label_window = 16
-    clip_size = 256
-    features = []
-    labels = []
-   
-    batch_uids = batch['video_uid']
-    batch_nodes = batch['nodes']
-    for uid, nodes in zip(batch_uids, batch_nodes):
-        try:
-            # 1. Get the direct stream URL
-            url = f'https://www.youtube.com/watch?v={uid}'
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=False)
-                direct_stream_url = info['url']
-            
-            #fps = info.get("fps")
-            w = int(info.get("width"))
-            h = int(info.get("height"))
-
-            target_size = 256
-            if w < h:
-                new_w = target_size
-                new_h = int(h * (target_size / w))
-            else:
-                new_h = target_size
-                new_w = int(w * (target_size / h))
-
-            # 2. Decode the video stream into frames
-            decoder = VideoDecoder(
-                direct_stream_url, 
-                device="cpu", 
-                seek_mode="approximate",  
-                transforms=[
-                    Resize(size=(new_h, new_w)),  # Resizes smaller edge to 256
-                    CenterCrop(size=(224, 224))   # Crops the center to 224x224
-                ]
-            )
-
-            total_frames = decoder.metadata.num_frames
-            fps = decoder.metadata.average_fps
-            remainder = total_frames % clip_size
-        
-            num_windows = total_frames // label_window
-            window_labels = torch.zeros(num_windows)
-
-            transition_frames = []
-            # Extract transition frames 
-            for node in nodes:
-                # Filter by your specific hierarchical level
-                start_time = node["start"]
-                end_time = node["end"]
-                
-                if end_time - start_time > 4.0: 
-                    start_frame = int(round(start_time * fps))
-                    end_frame = int(round(end_time * fps))
-                    
-                    transition_frames.append(start_frame)
-                    transition_frames.append(end_frame)
-            
-            transition_frames = list(set(transition_frames))
-
-            # Generate non-overlapping windows
-            for start_frame in range(0, total_frames - (total_frames % label_window), label_window):
-                end_frame = min(start_frame + label_window - 1, total_frames - 1)
-                
-                # Check if any transition falls within this window
-                has_transition = any(start_frame <= t <= end_frame for t in transition_frames)
-                window_label = 1 if has_transition else 0
-                window_labels[start_frame // label_window] = window_label
-
-            # 3. Extract Features
-            for start_idx in range(0, total_frames-remainder, clip_size):
-                end_idx = min(start_idx + clip_size, total_frames)
-                feature = decoder.get_frames_in_range(start=start_idx, stop=end_idx).data
-                feature = train_transform(feature)
-                label = window_labels[int(start_idx/label_window) : int(end_idx/label_window)]
-
-                features.append(feature)
-                labels.append(label)
-            
-        except ExtractorError as e:
-            print(f"Error processing {url}: {e}")
-            continue
-        except DownloadError as e:
-            print(f"Error processing {url}: {e}")
-            continue
-        except Exception as e:
-            print(f"Error processing {url}: {e}")
-            continue
-    
-    
-    return {"features": features, "labels": labels}
 
 
 def custom_collate_fn(batch):
@@ -210,7 +89,7 @@ def set_loader(config):
     train_dataset_new = train_dataset.map(
         process_youtube_videos, 
         batched=True, 
-        batch_size=2,
+        batch_size=1,
         remove_columns=train_dataset.column_names,
     )
 
@@ -220,9 +99,11 @@ def set_loader(config):
     train_loader = DataLoader(
         train_dataset_new,
         batch_size=4,
-        num_workers=8,
-        pin_memory=True,
+        #prefetch_factor=16,
+        num_workers=12,
+        #pin_memory=True,
         drop_last=True,
+        #persistent_workers=True,
         collate_fn=custom_collate_fn
     )
 
@@ -294,10 +175,10 @@ class UniversalTrainer:
 
         self.train_loader = train_loader
 
-        #for batch_idx, (inputs, targets) in enumerate(train_loader):
-        #    print(f"Batch {batch_idx}:")
-        #    print(f"  Inputs shape: {inputs.shape}")
-        #    print(f" Targets shape: {targets.shape}")
+        for batch_idx, (inputs, targets) in enumerate(train_loader):
+            print(f"Batch {batch_idx}:")
+            print(f"  Inputs shape: {inputs.shape}")
+            print(f" Targets shape: {targets.shape}")
             #print(f"  Inputs: \n{inputs}")
             #print(f"  Targets: {targets}\n")
         #self.logger.info(f"📊 Training clips: {train_info['total_clips']:,}")
@@ -434,6 +315,7 @@ class UniversalTrainer:
         """Train for one epoch"""
         self.model.train()
         total_loss = 0.0
+        action_accuracy = 0.0
         for batch_idx, (features, labels) in enumerate(self.train_loader):
             # Check for stop signal
             if self.should_stop:
@@ -486,9 +368,6 @@ class UniversalTrainer:
                 else:
                     outputs = self.model(features).permute(0, 2, 1)
                     labels = labels.long()
-                    print(outputs.shape)
-                    print(labels.shape)
-                    input("Getting output shape")
 
                     loss = self.criterion(outputs, labels)
 
@@ -502,13 +381,16 @@ class UniversalTrainer:
                         )
 
                     self.optimizer.step()
-                print(f"{batch_idx}: {loss.item()}")
+                print(f"{batch_idx}-loss: {loss.item()}")
                 pred_actions = outputs.argmax(dim=1)
                 true_actions = labels
                 action_accuracy += (
                     (pred_actions == true_actions).float().mean().item()
                 )
-                print(f"{batch_idx}: {action_accuracy}")
+                #print(pred_actions)
+
+                #print(labels)
+                print(f"{batch_idx}-accuracy: {action_accuracy/(batch_idx+1)}")
                 # Accumulate losses (uniform API)
                 total_loss += loss.item()
                 #print("Total loss:")
@@ -1062,7 +944,7 @@ def main():
 
     # Create trainer and start training
     trainer = UniversalTrainer(config)
-    trainer.train(resume_checkpoint=config.resume)
+    #trainer.train(resume_checkpoint=config.resume)
 
     # Clean up PID file on normal exit
     if config.background:

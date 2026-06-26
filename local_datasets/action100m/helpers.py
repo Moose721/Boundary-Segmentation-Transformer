@@ -176,39 +176,7 @@ class StatefulClipBuffer():
         features = []
         labels = []
         clips_processed = 0
-        '''
-        while clips_processed < self.max_batch_clips and len(self.sample_buffer) > 0:
-            sample_data = self.sample_buffer[0]
-            decoder = sample_data['decoder']
-            downsampled_frames = sample_data['downsampled_frames']
-            window_labels = sample_data['window_labels']
-            total_clips = sample_data['total_clips']
-
-            try: 
-                clip_start_idx = self.ptr_idx * self.clip_size
-                label_start_idx = self.ptr_idx * self.window_size
-                indices = downsampled_frames[clip_start_idx : clip_start_idx + self.clip_size]
-                feature = self.train_transform(decoder.get_frames_at(indices).data)
-                label = window_labels[label_start_idx : label_start_idx + self.window_size]
-
-            except RuntimeError as e:
-                print("Runtime error while decoding frames occured - skipping to next video")
-                del self.sample_buffer[0]
-                self.ptr_idx = 0
-                continue
-
-            features.append(feature)
-            labels.append(label)
-
-            clips_processed += 1
-            print(clips_processed)
-            self.ptr_idx += 1
-            if self.ptr_idx >= total_clips:
-                print("Video removed")
-                del self.sample_buffer[0]
-                self.ptr_idx = 0
-
-        '''
+        
         remaining_batch_clips = self.max_batch_clips
         while remaining_batch_clips > 0 and len(self.sample_buffer) > 0:
             sample_data = self.sample_buffer[0]
@@ -219,10 +187,12 @@ class StatefulClipBuffer():
             remaining_video_clips = total_clips - self.video_clip_ptr
             clip_start_idx = self.video_clip_ptr * self.clip_size
             clip_end_idx = (self.video_clip_ptr + remaining_batch_clips)*self.clip_size if remaining_video_clips > remaining_batch_clips else total_clips * self.clip_size
-
+            label_start_idx = clip_start_idx // 16
+            label_end_idx = clip_end_idx // 16
             try: 
                 indices = sample_data['downsampled_frames'][clip_start_idx : clip_end_idx]
                 feature = self.train_transform(decoder.get_frames_at(indices).data)
+                label = window_labels[label_start_idx : label_end_idx]
             except RuntimeError as e:
                 print("Runtime error while decoding frames occured - skipping to next video")
                 self.video_clip_ptr = 0
@@ -230,23 +200,21 @@ class StatefulClipBuffer():
                 continue
 
             if remaining_video_clips > remaining_batch_clips:
-                remaining_batch_clips = 0
                 self.video_clip_ptr += remaining_batch_clips
+                remaining_batch_clips = 0
             else:
-                remaining_batch_clips -= remaining_video_clips
                 self.video_clip_ptr = 0
+                remaining_batch_clips -= remaining_video_clips
                 del self.sample_buffer[0]
             
-            print(f"Remaining video clips: {remaining_video_clips}")
-            print(f"Remaining batch clips: {remaining_batch_clips}")
-            print(f"Clip start_idx: {clip_start_idx}")
-            print(f"Clip end_idx: {clip_end_idx}")
-            print(f"Sample buffer length: {len(self.sample_buffer)}")
-            time.sleep(10)
-            #update variables only after frames are decoded successfully
+            split_feature = torch.split(feature, self.clip_size, 0)
+            split_label = torch.split(label, self.window_size, 0)
+            assert len(split_feature) == len(split_label)
+            features.extend(split_feature)
+            labels.extend(split_label)
 
-
-
-        print(f"Buffer length at end: {len(self.sample_buffer)}")
+        assert len(features) == self.max_batch_clips
+        assert len(labels) == self.max_batch_clips
+        
         return {"features": features, "labels": labels}
             

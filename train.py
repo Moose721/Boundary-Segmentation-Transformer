@@ -42,6 +42,7 @@ import torch.nn as nn
 
 from local_datasets import *
 
+
 def set_seed(seed=42):
     """Set random seed for reproducibility"""
     random.seed(seed)
@@ -84,24 +85,28 @@ def set_loader(config):
         token=token
     )
 
-    train_dataset = dataset['train']
-    
-    train_dataset_new = train_dataset.map(
-        process_youtube_videos, 
+    clip_buffer = StatefulClipBuffer()
+
+    train_dataset = dataset['train'].remove_columns(["metadata"])
+    #shuffled_dataset = train_dataset.shuffle(buffer_size=100, seed=42)
+    shuffled_dataset = train_dataset
+    chunked_dataset = shuffled_dataset.map(
+        clip_buffer, 
         batched=True, 
-        batch_size=1,
+        batch_size=2,
         remove_columns=train_dataset.column_names,
     )
-
-    print(f"Number of shards: {train_dataset_new.n_shards}") 
+    #final_dataset = chunked_dataset.shuffle(buffer_size=32, seed=43)
+    final_dataset = chunked_dataset
+    #print(f"Number of shards: {train_dataset_new.n_shards}") 
 
     # Create data loaders
     train_loader = DataLoader(
-        train_dataset_new,
+        final_dataset,
         batch_size=4,
         #prefetch_factor=16,
-        num_workers=12,
-        #pin_memory=True,
+        num_workers=20,
+        pin_memory=True,
         drop_last=True,
         #persistent_workers=True,
         collate_fn=custom_collate_fn
@@ -152,10 +157,8 @@ class UniversalTrainer:
         self.criterion = set_criterion()
     
         #set up optimizer
-        self.lr = 4e-3
-        num_epochs=30
-        batches_per_epoch=197
-        #self.optimizer = Ranger21(params=self.model.parameters(), lr=self.lr, num_iterations=num_epochs*batches_per_epoch)
+        self.lr = 3e-4
+       
         self.optimizer = torch.optim.AdamW(
            params=self.model.parameters(), lr=self.lr, weight_decay=0.01
         )
@@ -175,10 +178,11 @@ class UniversalTrainer:
 
         self.train_loader = train_loader
 
-        for batch_idx, (inputs, targets) in enumerate(train_loader):
-            print(f"Batch {batch_idx}:")
-            print(f"  Inputs shape: {inputs.shape}")
-            print(f" Targets shape: {targets.shape}")
+        #for batch_idx, (inputs, targets) in enumerate(train_loader):
+        #    pass
+        #    print(f"Batch {batch_idx}:")
+        #    print(f"  Inputs shape: {inputs.shape}")
+        #    print(f" Targets shape: {targets.shape}")
             #print(f"  Inputs: \n{inputs}")
             #print(f"  Targets: {targets}\n")
         #self.logger.info(f"📊 Training clips: {train_info['total_clips']:,}")
@@ -316,6 +320,12 @@ class UniversalTrainer:
         self.model.train()
         total_loss = 0.0
         action_accuracy = 0.0
+        total_f1 = 0.0
+        total_precision = 0.0
+        total_recall = 0.0
+        total_tp = 0
+        total_fp = 0
+        total_fn = 0
         for batch_idx, (features, labels) in enumerate(self.train_loader):
             # Check for stop signal
             if self.should_stop:
@@ -337,7 +347,7 @@ class UniversalTrainer:
             try:
                 features = features.to(self.device)
                 labels = labels.to(self.device)
-
+     
                 # Zero gradients
                 self.optimizer.zero_grad()
 
@@ -381,22 +391,36 @@ class UniversalTrainer:
                         )
 
                     self.optimizer.step()
-                print(f"{batch_idx}-loss: {loss.item()}")
-                pred_actions = outputs.argmax(dim=1)
-                true_actions = labels
-                action_accuracy += (
-                    (pred_actions == true_actions).float().mean().item()
-                )
-                #print(pred_actions)
 
-                #print(labels)
-                print(f"{batch_idx}-accuracy: {action_accuracy/(batch_idx+1)}")
-                # Accumulate losses (uniform API)
+                preds = outputs.argmax(dim=1)
+                f1, precision, recall, tp, fp, fn = f1_score(preds, labels)
+                action_accuracy += ( (preds == labels).float().mean().item() )
+                total_tp += tp
+                total_fp += fp
+                total_fn += fn
                 total_loss += loss.item()
-                #print("Total loss:")
 
+                print(f"{batch_idx}-(loss, accuracy): {loss.item()}, {(preds == labels).float().mean()}")
+                print(f"{batch_idx}-(f1, precision, recall): {f1}, {precision}, {recall}")
+                print("\n")
                 # Log detailed batch info every 100 batches
                 if batch_idx % 100 == 0:
+                    #avg predicted accuracy over past 100 batches 
+                    print(f"Avg accuracy over last 100 batches for batch {batch_idx}: {action_accuracy/100.0}") 
+                    print(f"Avg loss over last 100 batches for batch {batch_idx}: {total_loss/100.0}")  
+                    action_accuracy = 0.0
+                    total_loss = 0.0
+
+                    epsilon = 1e-7
+                    total_precision = total_tp / (total_tp + total_fp + epsilon)
+                    total_recall = total_tp / (total_tp + total_fn + epsilon)
+
+                    # Calculate F1 Score
+                    total_f1 = 2 * (total_precision * total_recall) / (total_precision + total_recall + epsilon)
+                    print(f"Avg f1 over last 100 batches for batch {batch_idx}: {total_f1}") 
+                    total_tp = 0
+                    total_fp = 0
+                    total_fn = 0
                     #current_lr = self.optimizer.current_lr
                     #for param_group in self.optimizer.param_groups:
                     #    current_lr = param_group['lr']
@@ -944,7 +968,7 @@ def main():
 
     # Create trainer and start training
     trainer = UniversalTrainer(config)
-    #trainer.train(resume_checkpoint=config.resume)
+    trainer.train(resume_checkpoint=config.resume)
 
     # Clean up PID file on normal exit
     if config.background:

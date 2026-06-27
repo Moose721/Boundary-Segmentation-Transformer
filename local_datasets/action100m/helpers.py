@@ -2,6 +2,7 @@ import torch
 from datasets import load_dataset
 from torchvision.transforms import v2
 import time
+from collections import deque
 
 from huggingface_hub import HfApi
 from huggingface_hub.utils import LocalTokenNotFoundError
@@ -29,6 +30,7 @@ class StatefulClipBuffer():
         self.max_batch_clips = max_batch_clips
 
         self.video_clip_ptr = 0
+        self.video_buffer = deque()
         self.sample_buffer = []
         self.train_transform = v2.Compose([
             v2.ToDtype(torch.float32, scale=True),
@@ -49,7 +51,7 @@ class StatefulClipBuffer():
             'no_warnings': True,
             'skip_download': True,
             'ignoreerrors': True,
-            'logger': SilentLogger()
+            #'logger': SilentLogger()
         }
     
     def downsample_frames(self, total_frames, source_fps, target_fps):
@@ -79,8 +81,10 @@ class StatefulClipBuffer():
         assert frames_to_keep[-1] < total_frames
         return frames_to_keep
 
-
-    def initial_batch_process(self, batch):
+    def populate_sample_buffer(self):
+        if len(self.sample_buffer) > 10 or len(self.video_buffer) == 0:
+            return
+        batch = self.video_buffer.popleft()
         batch_uids = batch['video_uid']
         batch_nodes = batch['nodes']
         for uid, nodes in zip(batch_uids, batch_nodes):
@@ -167,11 +171,16 @@ class StatefulClipBuffer():
             except Exception as e:
                 #print(f"Error processing {url}: {e}")
                 continue
+
     
     def __call__(self, batch):
-        #print("Exact seek mode start")
-        self.initial_batch_process(batch)
-        print(f"Buffer length at start: {len(self.sample_buffer)}")
+        self.video_buffer.append(batch)
+        #print(f"Initial length of video buffer: {len(self.video_buffer)}")
+        self.populate_sample_buffer()
+        #print(f"Length of sample buffer after populating: {len(self.sample_buffer)}")
+        #print(f"Length of sample buffer: {len(self.sample_buffer)}")
+        #print("\n")
+        #print(f"Buffer length at start: {len(self.sample_buffer)}")
         
         features = []
         labels = []
@@ -194,7 +203,7 @@ class StatefulClipBuffer():
                 feature = self.train_transform(decoder.get_frames_at(indices).data)
                 label = window_labels[label_start_idx : label_end_idx]
             except RuntimeError as e:
-                print("Runtime error while decoding frames occured - skipping to next video")
+                print("Runtime error while decoding frames occurred - skipping to next video")
                 self.video_clip_ptr = 0
                 del self.sample_buffer[0]
                 continue
@@ -212,9 +221,6 @@ class StatefulClipBuffer():
             assert len(split_feature) == len(split_label)
             features.extend(split_feature)
             labels.extend(split_label)
-
-        assert len(features) == self.max_batch_clips
-        assert len(labels) == self.max_batch_clips
-        
+        #print(len(features))
         return {"features": features, "labels": labels}
             

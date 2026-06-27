@@ -40,8 +40,8 @@ from timm.loss import JsdCrossEntropy
 #import models
 import torch.nn as nn
 
+from local_datasets import *
 
-DATA_SYNC_ID = '100478946840763112718'
 
 def set_seed(seed=42):
     """Set random seed for reproducibility"""
@@ -53,131 +53,11 @@ def set_seed(seed=42):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-train_transform = v2.Compose([
-        v2.ToDtype(torch.float32, scale=True),
-        v2.RandomHorizontalFlip(),
-        #v2.RandomApply([
-        #    v2.ColorJitter(0.4, 0.4, 0.4, 0.1)
-        #], p=0.8),
-        #v2.RandomGrayscale(p=0.2),
-        #v2.Normalize(mean=[0.54, 0.5, 0.474], std=[0.234, 0.235, 0.231])
-    ])
-
 #used to initialize head weights
 def initialize_weights(m):
     if isinstance(m, (nn.Linear)):
         trunc_normal_(m.weight, std=.02)
         nn.init.constant_(m.bias, 0)
-
-def process_youtube_videos(batch, transform=None):
-    #print("Spawned thread")
-    ydl_opts = {
-        'cookiefile': 'premium_cookies.txt',
-        'format': 'bestvideo[ext=mp4]/mp4',  
-        'js_runtimes': { 'node': {'path': None} }, 
-        'extractor_args': {
-            'youtube': {
-                'player_skip': ['webpage', 'configs'],
-                #'player_client': ['web_safari', 'web_creator']
-            }
-        },
-        'quiet': True,
-        'no_warnings': True,
-        'skip_download': True
-    }
-
-    label_window = 16
-    clip_size = 256
-    features = []
-    labels = []
-   
-    batch_uids = batch['video_uid']
-    batch_nodes = batch['nodes']
-    for uid, nodes in zip(batch_uids, batch_nodes):
-        try:
-            # 1. Get the direct stream URL
-            url = f'https://www.youtube.com/watch?v={uid}'
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=False)
-                direct_stream_url = info['url']
-            
-            #fps = info.get("fps")
-            w = int(info.get("width"))
-            h = int(info.get("height"))
-
-            target_size = 256
-            if w < h:
-                new_w = target_size
-                new_h = int(h * (target_size / w))
-            else:
-                new_h = target_size
-                new_w = int(w * (target_size / h))
-
-            # 2. Decode the video stream into frames
-            decoder = VideoDecoder(
-                direct_stream_url, 
-                device="cpu", 
-                seek_mode="approximate",  
-                transforms=[
-                    Resize(size=(new_h, new_w)),  # Resizes smaller edge to 256
-                    CenterCrop(size=(224, 224))   # Crops the center to 224x224
-                ]
-            )
-
-            total_frames = decoder.metadata.num_frames
-            fps = decoder.metadata.average_fps
-            remainder = total_frames % clip_size
-        
-            num_windows = total_frames // label_window
-            window_labels = torch.zeros(num_windows)
-
-            transition_frames = []
-            # Extract transition frames 
-            for node in nodes:
-                # Filter by your specific hierarchical level
-                start_time = node["start"]
-                end_time = node["end"]
-                
-                if end_time - start_time > 4.0: 
-                    start_frame = int(round(start_time * fps))
-                    end_frame = int(round(end_time * fps))
-                    
-                    transition_frames.append(start_frame)
-                    transition_frames.append(end_frame)
-            
-            transition_frames = list(set(transition_frames))
-
-            # Generate non-overlapping windows
-            for start_frame in range(0, total_frames - (total_frames % label_window), label_window):
-                end_frame = min(start_frame + label_window - 1, total_frames - 1)
-                
-                # Check if any transition falls within this window
-                has_transition = any(start_frame <= t <= end_frame for t in transition_frames)
-                window_label = 1 if has_transition else 0
-                window_labels[start_frame // label_window] = window_label
-
-            # 3. Extract Features
-            for start_idx in range(0, total_frames-remainder, clip_size):
-                end_idx = min(start_idx + clip_size, total_frames)
-                feature = decoder.get_frames_in_range(start=start_idx, stop=end_idx).data
-                feature = train_transform(feature)
-                label = window_labels[int(start_idx/label_window) : int(end_idx/label_window)]
-
-                features.append(feature)
-                labels.append(label)
-            
-        except ExtractorError as e:
-            print(f"Error processing {url}: {e}")
-            continue
-        except DownloadError as e:
-            print(f"Error processing {url}: {e}")
-            continue
-        except Exception as e:
-            print(f"Error processing {url}: {e}")
-            continue
-    
-    
-    return {"features": features, "labels": labels}
 
 
 def custom_collate_fn(batch):
@@ -205,24 +85,30 @@ def set_loader(config):
         token=token
     )
 
-    train_dataset = dataset['train']
-    
-    train_dataset_new = train_dataset.map(
-        process_youtube_videos, 
+    clip_buffer = StatefulClipBuffer()
+
+    train_dataset = dataset['train'].remove_columns(["metadata"])
+    #shuffled_dataset = train_dataset.shuffle(buffer_size=100, seed=42)
+    shuffled_dataset = train_dataset
+    chunked_dataset = shuffled_dataset.map(
+        clip_buffer, 
         batched=True, 
         batch_size=2,
         remove_columns=train_dataset.column_names,
     )
-
-    print(f"Number of shards: {train_dataset_new.n_shards}") 
+    #final_dataset = chunked_dataset.shuffle(buffer_size=32, seed=43)
+    final_dataset = chunked_dataset
+    #print(f"Number of shards: {train_dataset_new.n_shards}") 
 
     # Create data loaders
     train_loader = DataLoader(
-        train_dataset_new,
+        final_dataset,
         batch_size=4,
-        num_workers=8,
+        #prefetch_factor=16,
+        num_workers=20,
         pin_memory=True,
         drop_last=True,
+        #persistent_workers=True,
         collate_fn=custom_collate_fn
     )
 
@@ -271,10 +157,8 @@ class UniversalTrainer:
         self.criterion = set_criterion()
     
         #set up optimizer
-        self.lr = 4e-3
-        num_epochs=30
-        batches_per_epoch=197
-        #self.optimizer = Ranger21(params=self.model.parameters(), lr=self.lr, num_iterations=num_epochs*batches_per_epoch)
+        self.lr = 3e-4
+       
         self.optimizer = torch.optim.AdamW(
            params=self.model.parameters(), lr=self.lr, weight_decay=0.01
         )
@@ -295,6 +179,7 @@ class UniversalTrainer:
         self.train_loader = train_loader
 
         #for batch_idx, (inputs, targets) in enumerate(train_loader):
+        #    pass
         #    print(f"Batch {batch_idx}:")
         #    print(f"  Inputs shape: {inputs.shape}")
         #    print(f" Targets shape: {targets.shape}")
@@ -434,6 +319,13 @@ class UniversalTrainer:
         """Train for one epoch"""
         self.model.train()
         total_loss = 0.0
+        action_accuracy = 0.0
+        total_f1 = 0.0
+        total_precision = 0.0
+        total_recall = 0.0
+        total_tp = 0
+        total_fp = 0
+        total_fn = 0
         for batch_idx, (features, labels) in enumerate(self.train_loader):
             # Check for stop signal
             if self.should_stop:
@@ -455,7 +347,7 @@ class UniversalTrainer:
             try:
                 features = features.to(self.device)
                 labels = labels.to(self.device)
-
+     
                 # Zero gradients
                 self.optimizer.zero_grad()
 
@@ -486,9 +378,6 @@ class UniversalTrainer:
                 else:
                     outputs = self.model(features).permute(0, 2, 1)
                     labels = labels.long()
-                    print(outputs.shape)
-                    print(labels.shape)
-                    input("Getting output shape")
 
                     loss = self.criterion(outputs, labels)
 
@@ -502,19 +391,36 @@ class UniversalTrainer:
                         )
 
                     self.optimizer.step()
-                print(f"{batch_idx}: {loss.item()}")
-                pred_actions = outputs.argmax(dim=1)
-                true_actions = labels
-                action_accuracy += (
-                    (pred_actions == true_actions).float().mean().item()
-                )
-                print(f"{batch_idx}: {action_accuracy}")
-                # Accumulate losses (uniform API)
-                total_loss += loss.item()
-                #print("Total loss:")
 
+                preds = outputs.argmax(dim=1)
+                f1, precision, recall, tp, fp, fn = f1_score(preds, labels)
+                action_accuracy += ( (preds == labels).float().mean().item() )
+                total_tp += tp
+                total_fp += fp
+                total_fn += fn
+                total_loss += loss.item()
+
+                print(f"{batch_idx}-(loss, accuracy): {loss.item()}, {(preds == labels).float().mean()}")
+                print(f"{batch_idx}-(f1, precision, recall): {f1}, {precision}, {recall}")
+                print("\n")
                 # Log detailed batch info every 100 batches
                 if batch_idx % 100 == 0:
+                    #avg predicted accuracy over past 100 batches 
+                    print(f"Avg accuracy over last 100 batches for batch {batch_idx}: {action_accuracy/100.0}") 
+                    print(f"Avg loss over last 100 batches for batch {batch_idx}: {total_loss/100.0}")  
+                    action_accuracy = 0.0
+                    total_loss = 0.0
+
+                    epsilon = 1e-7
+                    total_precision = total_tp / (total_tp + total_fp + epsilon)
+                    total_recall = total_tp / (total_tp + total_fn + epsilon)
+
+                    # Calculate F1 Score
+                    total_f1 = 2 * (total_precision * total_recall) / (total_precision + total_recall + epsilon)
+                    print(f"Avg f1 over last 100 batches for batch {batch_idx}: {total_f1}") 
+                    total_tp = 0
+                    total_fp = 0
+                    total_fn = 0
                     #current_lr = self.optimizer.current_lr
                     #for param_group in self.optimizer.param_groups:
                     #    current_lr = param_group['lr']
